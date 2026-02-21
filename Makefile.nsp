@@ -51,6 +51,7 @@ CFLAGS += -include src/nspire/gfx/gbi_nsp.h
 # Nspire platform layer (new code)
 NSPIRE_SRCS := \
     src/nspire/platform/main_nsp.c \
+    src/nspire/platform/nsp_replacements.c \
     src/nspire/platform/audio_stubs.c \
     src/nspire/platform/input_nsp.c \
     src/nspire/configfile.c \
@@ -59,11 +60,11 @@ NSPIRE_SRCS := \
     src/nspire/gfx/gfx_nsp.c
 
 # MM game code — core files needed for the game to run
+# NOTE: main.c, sched.c, padmgr.c are replaced by our Nspire implementations
 # This list will need to grow as compilation progresses
 MM_CORE_SRCS := \
     src/code/game.c \
     src/code/graph.c \
-    src/code/main.c \
     src/code/z_play.c \
     src/code/z_scene.c \
     src/code/z_scene_proc.c \
@@ -76,6 +77,7 @@ MM_CORE_SRCS := \
     src/code/z_draw.c \
     src/code/z_lib.c \
     src/code/z_skelanime.c \
+    src/code/z_DLF.c \
     src/code/sys_matrix.c \
     src/code/sys_math.c \
     src/code/sys_math3d.c \
@@ -97,8 +99,6 @@ MM_CORE_SRCS := \
     src/code/z_inventory.c \
     src/code/z_debug.c \
     src/code/z_path.c \
-    src/code/sched.c \
-    src/code/padmgr.c \
     src/code/title_setup.c
 
 # NOTE: Many more files will need to be added as dependencies resolve.

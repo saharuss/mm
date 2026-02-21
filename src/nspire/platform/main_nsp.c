@@ -1,18 +1,21 @@
 /**
  * main_nsp.c — TI-Nspire CX entry point for Majora's Mask
  *
- * This replaces the N64's boot sequence (idle thread → main → graph thread)
- * with a single-threaded game loop on the Nspire.
+ * Architecture overview:
  *
- * On the N64, the game runs as:
- *   1. Idle thread starts Main()
- *   2. Main() creates the Graph thread
- *   3. Graph thread creates game states and runs the game loop
- *   4. Each frame, Graph_TaskSet00 sends display lists to the RCP
+ * On the N64, MM's boot sequence is:
+ *   idle thread → Main() → creates graph thread → Graph_ThreadEntry()
+ *   Graph_ThreadEntry loops: load overlay → GameState_Init → Graph_Update loop
+ *   Graph_Update: GameState_GetInput → GameState_IncrementFrameCount →
+ *                 Audio_Update → Graph_ExecuteAndDraw
+ *   Graph_ExecuteAndDraw: GameState_Update (builds display lists) →
+ *                         Graph_TaskSet00 (sends display list to RCP)
  *
- * On the Nspire, we flatten this into:
- *   1. main() initializes the LCD and software renderer
- *   2. Game loop: poll input → update game state → process display list → blit
+ * On the Nspire, we:
+ *   1. Initialize LCD + software renderer
+ *   2. Call Graph_ThreadEntry directly (it handles its own loop)
+ *   3. Intercept Graph_TaskSet00 to route display lists to our renderer
+ *   4. Replace overlay loading with static function pointers
  */
 #ifdef TARGET_NSP
 #include <libndls.h>
@@ -23,31 +26,24 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#include "nspire/platform/os_stubs.h"
-#include "nspire/gfx/gbi_nsp.h"
-#include "nspire/configfile.h"
-#include "nspire/fixed_pt.h"
+/* ============================================================
+ * Forward declarations for the rendering backend (from sm64-nsp)
+ * ============================================================ */
 
-/* Forward declarations for the rendering backend (from sm64-nsp) */
-extern void gfx_init(void);
-extern void gfx_start_frame(void);
-extern void gfx_run_dl(Gfx* dl);
-extern void gfx_end_frame(void);
+/* Nspire LCD + renderer */
 extern void nsp_init(const char* name, bool fullscreen);
 extern void nsp_swap_buffers_begin(void);
 extern void nsp_swap_buffers_end(void);
-extern int nsp_get_dimensions(uint32_t* w, uint32_t* h);
 
-/* Forward declarations for input */
+/* Input */
 extern void input_nsp_poll(void);
 extern bool input_nsp_escape_pressed(void);
 
-/* Forward declarations for the game — these exist in MM's code */
-extern void GameState_Init(void* gameState);
-extern void GameState_Update(void* gameState);
-extern void Graph_ThreadEntry(void* arg);
+/* Config */
+extern void configfile_load(const char* filename);
+extern void configfile_save(const char* filename);
 
-/* Timer utilities */
+/* Timer */
 #ifdef TARGET_NSP
 extern void tmr_init(void);
 extern uint32_t tmr_ms(void);
@@ -60,59 +56,132 @@ static inline uint32_t tmr_ms(void) {
 #endif
 
 /* ============================================================
+ * Globals that MM's code expects to exist
+ * ============================================================ */
+#include "nspire/platform/os_stubs.h"
+#include "nspire/gfx/gbi_nsp.h"
+
+/* Display list master — MM generates display lists into this */
+/* These are defined as externs in MM code; we provide the storage */
+
+/* Frame timing */
+static uint32_t nsp_frame_count = 0;
+static uint32_t nsp_last_fps_time = 0;
+uint32_t nsp_current_fps = 0;
+
+static void nsp_update_fps(void) {
+    nsp_frame_count++;
+    uint32_t now = tmr_ms();
+    if (now - nsp_last_fps_time >= 1000) {
+        nsp_current_fps = nsp_frame_count;
+        nsp_frame_count = 0;
+        nsp_last_fps_time = now;
+    }
+}
+
+/* ============================================================
  * Display List Processing
  *
- * MM builds display lists (arrays of Gfx commands) each frame.
- * On the N64, these are sent to the RSP/RDP for hardware execution.
- * Here we walk the display list and dispatch each command to
- * the sm64-nsp software renderer.
+ * This is the heart of the port. When MM calls Graph_TaskSet00(),
+ * instead of sending the display list to the N64 RCP, we walk it
+ * and route each command to sm64-nsp's software renderer.
  * ============================================================ */
 
-/* Segment table — MM uses segmented addressing for display lists */
-static uintptr_t segment_table[16];
+/* Segment table for segmented addressing */
+static uintptr_t nsp_segments[16];
 
 void nsp_set_segment(uint32_t seg, void* addr) {
-    segment_table[seg & 0xF] = (uintptr_t)addr;
+    nsp_segments[seg & 0xF] = (uintptr_t)addr;
 }
 
 void* nsp_segmented_to_virtual(uint32_t addr) {
     uint32_t seg = (addr >> 24) & 0xF;
     uint32_t offset = addr & 0x00FFFFFF;
-    return (void*)(segment_table[seg] + offset);
+    if (nsp_segments[seg] == 0)
+        return (void*)(uintptr_t)offset;
+    return (void*)(nsp_segments[seg] + offset);
 }
 
 /**
- * Process a single display list recursively.
- * This is the core of the Nspire port — it interprets the Gfx commands
- * that MM generates and routes them to the software renderer.
+ * Walk a display list and dispatch commands to the software renderer.
+ *
+ * This is called from our replacement Graph_TaskSet00.
+ * The display list pointer comes from gGfxMasterDL->taskStart,
+ * which is where Graph_ExecuteAndDraw builds the master display list.
  */
+#define DL_STACK_SIZE 16
+static Gfx* dl_stack[DL_STACK_SIZE];
+static int dl_stack_top = 0;
+
+static void dl_push(Gfx* dl) {
+    if (dl_stack_top < DL_STACK_SIZE) {
+        dl_stack[dl_stack_top++] = dl;
+    }
+}
+
+static Gfx* dl_pop(void) {
+    if (dl_stack_top > 0) {
+        return dl_stack[--dl_stack_top];
+    }
+    return NULL;
+}
+
 void nsp_process_display_list(Gfx* dl) {
     if (!dl)
         return;
 
-    /* The display list is an array of 64-bit commands.
-     * We iterate until we hit G_ENDDL. */
+    dl_stack_top = 0;
+
     while (1) {
         uint32_t w0 = dl->w0;
         uint32_t w1 = dl->w1;
         uint8_t cmd = (w0 >> 24) & 0xFF;
 
         switch (cmd) {
-            case G_ENDDL:
-                return;
+            case G_ENDDL: {
+                /* End of this display list — pop the stack */
+                Gfx* parent = dl_pop();
+                if (parent) {
+                    dl = parent;
+                    continue;
+                }
+                return; /* No more parent DLs, we're done */
+            }
 
             case G_DL: {
-                /* Call or branch to a child display list */
+                /* Call or branch to child display list */
                 Gfx* child = (Gfx*)(uintptr_t)w1;
                 if (child) {
-                    nsp_process_display_list(child);
+                    bool is_branch = (w0 & 0x00FF0000) == 0x00010000;
+                    if (!is_branch) {
+                        /* Call: push return address */
+                        dl_push(dl + 1);
+                    }
+                    dl = child;
+                    continue;
                 }
-                /* If this is a branch (not call), return after */
-                if ((w0 & 0x00FF0000) == 0x00010000)
-                    return;
                 break;
             }
 
+            case G_MOVEMEM: {
+                /* Handle segment setting */
+                uint8_t index = (w0 >> 8) & 0xFF;
+                uint8_t offset = (w0 >> 0) & 0xFF;
+                /* Check if this is a segment command (MW_SEGMENT) */
+                if (index == G_MW_SEGMENT) {
+                    uint32_t seg_id = offset / 4;
+                    nsp_set_segment(seg_id, (void*)(uintptr_t)w1);
+                }
+                break;
+            }
+
+            /* All graphics commands passed through to the software renderer.
+             * The sm64-nsp gfx_frontend already handles all of these GBI
+             * commands via its own display list interpreter.
+             *
+             * TODO: Route these to gfx_run_dl() once the frontend is
+             * hooked up. For now, the game state machinery runs but
+             * rendering is a no-op until the frontend glue is complete. */
             case G_VTX:
             case G_TRI1:
             case G_TRI2:
@@ -139,13 +208,7 @@ void nsp_process_display_list(Gfx* dl) {
             case G_SETOTHERMODE_L:
             case G_SETOTHERMODE_H:
             case G_TEXRECT:
-            case G_MOVEMEM:
-                /* All of these are passed to the software renderer's
-                 * display list interpreter (gfx_frontend.c from sm64-nsp).
-                 * The renderer already knows how to handle all these GBI commands.
-                 *
-                 * TODO: Hook up gfx_run_dl() to process these commands.
-                 *       For now, we just skip them. */
+                /* These would go to the software renderer */
                 break;
 
             case G_RDPPIPESYNC:
@@ -154,11 +217,10 @@ void nsp_process_display_list(Gfx* dl) {
             case G_RDPFULLSYNC:
             case G_SPNOOP:
             case G_NOOP:
-                /* Sync/NOP commands — no-ops for software renderer */
+                /* Sync/NOP — no-ops for software renderer */
                 break;
 
             default:
-                /* Unknown command — skip */
                 break;
         }
 
@@ -167,41 +229,105 @@ void nsp_process_display_list(Gfx* dl) {
 }
 
 /* ============================================================
- * Frame Timing
+ * ROM File-Based Asset Loading
+ *
+ * MM loads assets from the N64 ROM cartridge via DMA (PI interface).
+ * On the Nspire, we read from a ROM file on the filesystem.
  * ============================================================ */
-static uint32_t frame_count = 0;
-static uint32_t last_fps_time = 0;
-static uint32_t current_fps = 0;
 
-static void update_fps(void) {
-    frame_count++;
-    uint32_t now = tmr_ms();
-    if (now - last_fps_time >= 1000) {
-        current_fps = frame_count;
-        frame_count = 0;
-        last_fps_time = now;
+static FILE* rom_file = NULL;
+
+/**
+ * Open the ROM file for asset reading.
+ * Must be called before any DMA operations.
+ */
+int nsp_rom_init(const char* rom_path) {
+    rom_file = fopen(rom_path, "rb");
+    return (rom_file != NULL) ? 0 : -1;
+}
+
+void nsp_rom_close(void) {
+    if (rom_file) {
+        fclose(rom_file);
+        rom_file = NULL;
     }
+}
+
+/**
+ * Read data from the ROM file.
+ * Replaces N64 PI DMA transfers (osPiStartDma).
+ *
+ * @param rom_addr  Offset into the ROM (the "VROM" address)
+ * @param dest      RAM destination buffer
+ * @param size      Number of bytes to read
+ * @return          0 on success, -1 on failure
+ */
+int nsp_rom_read(uint32_t rom_addr, void* dest, uint32_t size) {
+    if (!rom_file)
+        return -1;
+    fseek(rom_file, rom_addr, SEEK_SET);
+    size_t read = fread(dest, 1, size, rom_file);
+    return (read == size) ? 0 : -1;
+}
+
+/* ============================================================
+ * Static Overlay Linking
+ *
+ * On the N64, game state overlays and actor overlays are loaded
+ * dynamically from ROM. On the Nspire, we statically link
+ * everything and provide direct function pointers.
+ * ============================================================ */
+
+/* Forward declarations for game state init functions.
+ * These are defined in MM's overlay source files. */
+struct GameState;
+typedef void (*GameStateFunc)(struct GameState*);
+
+/* Game state overlay init functions (from MM source) */
+extern void TitleSetup_Init(void* gameState);
+extern void Select_Init(void* gameState);
+extern void Title_Init(void* gameState);
+extern void Opening_Init(void* gameState);
+extern void FileSelect_Init(void* gameState);
+extern void Play_Init(void* gameState);
+
+/**
+ * Replacement for Overlay_LoadGameState.
+ * Instead of loading from ROM and relocating, we just ensure
+ * the function pointers are already set (since we statically linked).
+ */
+void nsp_overlay_load_gamestate(void* overlayEntry) {
+    /* No-op: everything is statically linked.
+     * The game state table's init/destroy pointers already
+     * point to the correct functions. */
+    (void)overlayEntry;
+}
+
+/**
+ * Replacement for Overlay_FreeGameState.
+ */
+void nsp_overlay_free_gamestate(void* overlayEntry) {
+    (void)overlayEntry;
 }
 
 /* ============================================================
  * Nspire Main Entry Point
+ *
+ * Strategy: Rather than reimplementing the entire game loop,
+ * we let MM's existing Graph_ThreadEntry run. We just need to:
+ * 1. Initialize the Nspire hardware
+ * 2. Provide stubs for all N64-specific functions it calls
+ * 3. Intercept Graph_TaskSet00 to process display lists
+ * 4. Call Graph_ThreadEntry directly
  * ============================================================ */
 
-/**
- * The main game loop for the Nspire port.
- *
- * This replaces the N64's multi-threaded architecture with a simple
- * single-threaded loop:
- *
- *   1. Initialize LCD + software renderer
- *   2. Load config
- *   3. Loop:
- *      a. Poll Nspire keypad → N64 controller state
- *      b. Run one frame of game logic
- *      c. Process the generated display list
- *      d. Blit framebuffer to LCD
- *      e. Check for ESC (quit)
- */
+/* MM's entry point — we call this directly */
+extern void Graph_ThreadEntry(void* arg);
+
+/* Provided by MM code */
+extern void SysCfb_Init(void);
+extern void Fault_Init(void);
+
 int main(void) {
     /* Initialize config */
     configfile_load("mm-nsp.cfg");
@@ -210,67 +336,37 @@ int main(void) {
     nsp_init("Majora's Mask", false);
     tmr_init();
 
-    /* Initialize software renderer */
-    gfx_init();
-
-    /* Initialize game
-     * On the N64, Main() creates threads and Graph_ThreadEntry
-     * runs the game loop. Here we'd need to initialize game state
-     * directly. This is the part that requires the most work —
-     * we need to call the game's initialization without going
-     * through the N64 threading system.
-     *
-     * TODO: This is where the bulk of remaining integration work lives.
-     * Game state initialization needs to be called directly,
-     * and the game loop needs to be driven from here instead of
-     * from Graph_ThreadEntry.
-     */
-
-    /* Main game loop */
-    bool running = true;
-    uint32_t frameskip_counter = 0;
-
-    while (running) {
-        /* Poll input */
-        input_nsp_poll();
-
-        /* Check quit */
-        if (input_nsp_escape_pressed()) {
-            running = false;
-            break;
-        }
-
-        /* Frameskip — only render every (configFrameskip + 1) frames */
-        frameskip_counter++;
-        bool should_render = (frameskip_counter > configFrameskip);
-        if (should_render) {
-            frameskip_counter = 0;
-        }
-
-        /* TODO: Run one frame of game logic here
-         * This would call the game state update function,
-         * which builds up a display list.
-         */
-
-        /* Render frame */
-        if (should_render) {
-            gfx_start_frame();
-
-            /* TODO: Process the display list generated by the game
-             * nsp_process_display_list(game_display_list);
-             */
-
-            gfx_end_frame();
-
-            /* Blit to LCD */
-            nsp_swap_buffers_begin();
-            nsp_swap_buffers_end();
-        }
-
-        update_fps();
+    /* Open ROM file for asset loading */
+    if (nsp_rom_init("mm-us.z64") != 0) {
+        /* ROM not found — can't run without it */
+#ifdef TARGET_NSP
+        /* Show error on Nspire screen */
+        /* TODO: nio_printf error */
+#endif
+        return 1;
     }
 
+    /*
+     * Call MM's Graph_ThreadEntry directly.
+     *
+     * This function does everything:
+     * - Allocates gfx pools
+     * - Initializes GraphicsContext
+     * - Loops through game states (title → file select → gameplay)
+     * - Each frame calls Graph_Update → Graph_ExecuteAndDraw
+     * - Will return when the game exits
+     *
+     * The key interception points are:
+     * - Graph_TaskSet00: we replace this to process display lists
+     *   through our software renderer instead of the N64 RCP
+     * - PadMgr_GetInput: we replace this to read from Nspire keypad
+     * - All audio functions: stubbed to no-ops
+     * - Overlay loading: replaced with static linking
+     */
+    Graph_ThreadEntry(NULL);
+
     /* Cleanup */
+    nsp_rom_close();
     configfile_save("mm-nsp.cfg");
 
 #ifdef TARGET_NSP
